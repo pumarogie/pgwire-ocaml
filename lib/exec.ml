@@ -222,6 +222,7 @@ let proj_fns t items =
           go "" renderers
         in
         [ ("?column?", Catalog.Text, render, None) ]
+      | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items require no FROM clause"))
       | Sql.Agg _ -> raise (Sql_error ("42601", "aggregate requires GROUP BY or an aggregate-only select")))
     items
 
@@ -230,11 +231,25 @@ let agg_desc t items =
     (function
       | Sql.Star -> raise (Sql_error ("42601", "cannot use * with aggregates"))
       | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported alongside aggregates"))
+      | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items require no FROM clause"))
       | Sql.Col c -> col_desc c (col_typ t c)
       | Sql.Agg (Sql.Count, _) -> col_desc "count" Catalog.Int
       | Sql.Agg (Sql.Avg, _) -> col_desc "avg" Catalog.Float
       | Sql.Agg (a, Some c) -> col_desc (agg_name a) (col_typ t c) (* SUM/MIN/MAX keep the column type *)
       | Sql.Agg (a, None) -> col_desc (agg_name a) Catalog.Int)
+    items
+
+(* SELECT <literals> with no FROM: one row, each column named "?column?" *)
+let const_row items =
+  let typ_of = function
+    | Catalog.VInt _ -> Catalog.Int | Catalog.VText _ -> Catalog.Text
+    | Catalog.VBool _ -> Catalog.Bool | Catalog.VFloat _ -> Catalog.Float
+    | Catalog.VNull -> Catalog.Text
+  in
+  List.map
+    (function
+      | Sql.Const v -> (col_desc "?column?" (typ_of v), text_of_value v)
+      | _ -> raise (Sql_error ("42601", "only constant expressions are supported without FROM")))
     items
 
 let select_output_desc t sel =
@@ -392,6 +407,7 @@ let run_join ~notice name1 name2 (lref, rref) kind sel =
         | Sql.Star -> List.mapi (fun i (_, c, ty) -> (c, ty, i)) schema
         | Sql.Col s -> let i = resolve s in let _, c, ty = List.nth schema i in [ (c, ty, i) ]
         | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported with JOIN"))
+        | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items are not supported with JOIN"))
         | Sql.Agg _ -> raise (Sql_error ("0A000", "aggregates are not supported with JOIN")))
       sel.Sql.items
   in
@@ -424,7 +440,8 @@ let describe stmt =
       | None -> raise (Sql_error ("42P01", Printf.sprintf "relation \"%s\" does not exist" tname))
       | Some t -> Some (select_output_desc t sel))
     | Sql.Join (a, b, on, k) -> (
-      match run_join ~notice:(fun _ -> ()) a b on k sel with Rows (desc, _) -> Some desc | Tag _ -> None))
+      match run_join ~notice:(fun _ -> ()) a b on k sel with Rows (desc, _) -> Some desc | Tag _ -> None)
+    | Sql.NoFrom -> Some (List.map fst (const_row sel.Sql.items)))
   | _ -> None
 
 
@@ -479,6 +496,7 @@ let run_plain ?(presorted = false) t sel candidates =
 let agg_maker t = function
   | Sql.Star -> raise (Sql_error ("42601", "cannot use * with aggregates"))
   | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported alongside aggregates"))
+  | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items require no FROM clause"))
   | Sql.Col c ->
     let i = col_idx t c in
     let v = ref Catalog.VNull and got = ref false in
@@ -772,4 +790,8 @@ let rec run ?(notice = fun _ -> ()) stmt =
     let sel = resolve_order sel in
     match sel.Sql.from with
     | Sql.Table tname -> run_table ~notice tname (normalize_single tname sel)
-    | Sql.Join (a, b, on, k) -> run_join ~notice a b on k sel)
+    | Sql.Join (a, b, on, k) -> run_join ~notice a b on k sel
+    | Sql.NoFrom ->
+      (* constant probe: SELECT <literals> with no table -> a single row *)
+      let descs, row = List.split (const_row sel.Sql.items) in
+      Rows (descs, [ row ]))

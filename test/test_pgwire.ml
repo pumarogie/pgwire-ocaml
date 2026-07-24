@@ -635,6 +635,13 @@ let test_comments () =
    | _ -> assert false);
   ok "sql comments: line (--) and block (/* */) skipped"
 
+let test_select_no_from () =
+  (* liveness/introspection probe: SELECT <const> with no FROM -> one row *)
+  assert (rows_of (run "SELECT 1") = [ [ Some "1" ] ]);
+  assert (rows_of (run "SELECT 1, 2, 3") = [ [ Some "1"; Some "2"; Some "3" ] ]);
+  assert (rows_of (run "SELECT 'ok'") = [ [ Some "ok" ] ]);
+  ok "select: constant expression without FROM (SELECT 1)"
+
 let test_params () =
   ignore (run "CREATE TABLE t_p (a int, b text)");
   let ins = Exec.bind [| Catalog.VInt 5; Catalog.VText "x" |] (Sql.parse "INSERT INTO t_p VALUES ($1, $2)") in
@@ -717,6 +724,7 @@ let () =
   test_multirow_insert ();
   test_order_ordinal_nulls ();
   test_having_andor ();
+  test_select_no_from ();
   test_params ();
   test_errors ();
   test_persistence ();

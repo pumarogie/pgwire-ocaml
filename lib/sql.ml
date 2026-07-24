@@ -19,6 +19,7 @@ type agg = Count | Sum | Min | Max | Avg
 type concpart = CPcol of string | CPval of Catalog.value
 type sel_item = Star | Col of string | Agg of agg * string option (* arg None = star form *)
               | Concat of concpart list (* a || b || 'x' *)
+              | Const of Catalog.value (* literal in the select list, e.g. SELECT 1 *)
 type order = {
   by : string; (* column name; "" when an ordinal is used *)
   ordinal : int option; (* ORDER BY 1 -> select-list position *)
@@ -29,7 +30,7 @@ type order = {
 (* FROM clause: a single table, or an equi-join of two tables.
    Column references may be qualified ("emp.dept") — kept as "tbl.col" strings. *)
 type join_kind = Inner | Left | Right | Full
-type source = Table of string | Join of string * string * (string * string) * join_kind
+type source = Table of string | Join of string * string * (string * string) * join_kind | NoFrom
 
 (* a WHERE predicate: comparison / IS [NOT] NULL / boolean combinations *)
 type pred =
@@ -327,7 +328,7 @@ let parse sql =
       let arg = match peek () with Some (TSym '*') -> advance (); None | _ -> Some (colname ()) in
       sym ')';
       Agg (a, arg)
-    | Some (TStr _ | TNum _ | TIdent _ | TQuoted _) ->
+    | Some (TStr _ | TNum _ | TFloat _ | TIdent _ | TQuoted _) ->
       (* a column or literal, possibly the start of a `||` concatenation *)
       let operand () =
         match peek () with
@@ -343,7 +344,8 @@ let parse sql =
         while peek () = Some TConcat do advance (); parts := operand () :: !parts done;
         Concat (List.rev !parts)
       end
-      else (match first with CPcol c -> Col c | CPval _ -> failwith "expected column, '*', or aggregate")
+      (* a lone column, or a lone literal (SELECT 1) *)
+      else (match first with CPcol c -> Col c | CPval v -> Const v)
     | _ -> failwith "expected column, '*', or aggregate"
   in
   let parse_select () =
@@ -356,22 +358,25 @@ let parse sql =
       | _ -> ()
     in
     more ();
-    expect_kw "from";
-    let t1 = name () in
-    let build kind =
-      let t2 = name () in
-      expect_kw "on";
-      let l = colname () in
-      (match peek () with Some (TSym '=') -> advance () | _ -> failwith "expected '=' in JOIN ON");
-      let r = colname () in
-      Join (t1, t2, (l, r), kind)
-    in
+    (* FROM is optional: "SELECT 1" (constant probe) has no table *)
     let from =
-      if opt_kw "left" then (ignore (opt_kw "outer"); expect_kw "join"; build Left)
-      else if opt_kw "right" then (ignore (opt_kw "outer"); expect_kw "join"; build Right)
-      else if opt_kw "full" then (ignore (opt_kw "outer"); expect_kw "join"; build Full)
-      else if opt_kw "join" then build Inner
-      else Table t1
+      if not (opt_kw "from") then NoFrom
+      else begin
+        let t1 = name () in
+        let build kind =
+          let t2 = name () in
+          expect_kw "on";
+          let l = colname () in
+          (match peek () with Some (TSym '=') -> advance () | _ -> failwith "expected '=' in JOIN ON");
+          let r = colname () in
+          Join (t1, t2, (l, r), kind)
+        in
+        if opt_kw "left" then (ignore (opt_kw "outer"); expect_kw "join"; build Left)
+        else if opt_kw "right" then (ignore (opt_kw "outer"); expect_kw "join"; build Right)
+        else if opt_kw "full" then (ignore (opt_kw "outer"); expect_kw "join"; build Full)
+        else if opt_kw "join" then build Inner
+        else Table t1
+      end
     in
     let where = parse_where () in
     let group_by = if opt_kw "group" then (expect_kw "by"; Some (name ())) else None in
