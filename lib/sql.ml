@@ -75,6 +75,15 @@ let tokenize s =
   while !i < n do
     let c = s.[!i] in
     if c = ' ' || c = '\t' || c = '\n' || c = '\r' then incr i
+    else if c = '-' && !i + 1 < n && s.[!i + 1] = '-' then
+      (* line comment: skip to end of line *)
+      while !i < n && s.[!i] <> '\n' do incr i done
+    else if c = '/' && !i + 1 < n && s.[!i + 1] = '*' then begin
+      (* block comment: skip to the closing */ *)
+      i := !i + 2;
+      while !i + 1 < n && not (s.[!i] = '*' && s.[!i + 1] = '/') do incr i done;
+      i := if !i + 1 < n then !i + 2 else n
+    end
     else if c = '(' || c = ')' || c = ',' || c = ';' || c = '=' || c = '*' || c = '.' then (
       toks := TSym c :: !toks;
       incr i)

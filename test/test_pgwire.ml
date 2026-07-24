@@ -497,6 +497,21 @@ let test_cost_planner () =
   assert (List.length (rows_of (run "SELECT id FROM cp WHERE id > 100")) = 900);
   ok "cost planner: selective range uses index, non-selective uses seq"
 
+let test_comments () =
+  (* line comment to end of input *)
+  (match Sql.parse "SELECT id FROM t -- trailing comment" with
+   | Sql.Select { items = [ Sql.Col "id" ]; from = Sql.Table "t"; _ } -> ()
+   | _ -> assert false);
+  (* block comment mid-statement *)
+  (match Sql.parse "SELECT /* inline */ id FROM t" with
+   | Sql.Select { items = [ Sql.Col "id" ]; from = Sql.Table "t"; _ } -> ()
+   | _ -> assert false);
+  (* line comment before a newline, statement continues *)
+  (match Sql.parse "SELECT id -- pick id\nFROM t" with
+   | Sql.Select { from = Sql.Table "t"; _ } -> ()
+   | _ -> assert false);
+  ok "sql comments: line (--) and block (/* */) skipped"
+
 let test_params () =
   ignore (run "CREATE TABLE t_p (a int, b text)");
   let ins = Exec.bind [| Catalog.VInt 5; Catalog.VText "x" |] (Sql.parse "INSERT INTO t_p VALUES ($1, $2)") in
@@ -567,6 +582,7 @@ let () =
   test_index_order ();
   test_large_result ();
   test_cost_planner ();
+  test_comments ();
   test_params ();
   test_errors ();
   test_persistence ();
