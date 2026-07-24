@@ -44,7 +44,7 @@ let test_parser () =
    | Sql.Select { from = Sql.Join ("a", "b", ("a.k", "b.k"), Sql.Left); _ } -> ()
    | _ -> assert false);
   (match Sql.parse "INSERT INTO t VALUES ($1, $2)" with
-   | Sql.Insert ("t", [ Sql.Param 1; Sql.Param 2 ]) -> ()
+   | Sql.Insert ("t", None, [ [ Sql.Param 1; Sql.Param 2 ] ]) -> ()
    | _ -> assert false);
   assert (Sql.parse "CREATE INDEX ON t (a)" = Sql.CreateIndex ("t", "a"));
   (* unknown leading keyword becomes a harmless Other tag *)
@@ -57,7 +57,7 @@ let test_parser () =
    | Sql.Select { items = [ Sql.Col "a"; Sql.Agg (Sql.Sum, Some "b") ]; group_by = Some "a"; _ } -> ()
    | _ -> assert false);
   (match Sql.parse "SELECT * FROM t ORDER BY a DESC LIMIT 5" with
-   | Sql.Select { order_by = Some { Sql.by = "a"; desc = true }; limit = Some (Sql.Lit (Catalog.VInt 5)); _ } -> ()
+   | Sql.Select { order_by = Some { Sql.by = "a"; desc = true; _ }; limit = Some (Sql.Lit (Catalog.VInt 5)); _ } -> ()
    | _ -> assert false);
   ok "parser: select/insert/param/index/aggregate/order/limit/other"
 
@@ -507,6 +507,119 @@ let test_cost_planner () =
   assert (List.length (rows_of (run "SELECT id FROM cp WHERE id > 100")) = 900);
   ok "cost planner: selective range uses index, non-selective uses seq"
 
+(* ===== batch of 10 SQL features (one PR) ===== *)
+
+let names_of = function Exec.Rows (desc, _) -> List.map (fun (n, _, _) -> n) desc | Exec.Tag _ -> assert false
+let tag_of = function Exec.Tag t -> t | Exec.Rows _ -> assert false
+let _ = (names_of, tag_of) (* used by later tests in this batch *)
+
+(* #6 — float rounds to nearest int on insert into an int column (PG behavior) *)
+let test_coerce_round () =
+  ignore (run "CREATE TABLE cr (i int)");
+  ignore (run "INSERT INTO cr VALUES (9.99)");
+  ignore (run "INSERT INTO cr VALUES (2.4)");
+  assert (List.sort compare (rows_of (run "SELECT i FROM cr")) = [ [ Some "10" ]; [ Some "2" ] ]);
+  ok "coerce: float rounds to nearest int, not truncate (#6)"
+
+(* #31 — double-quoted identifiers preserve case (unquoted still folds lower) *)
+let test_quoted_idents () =
+  ignore (run "CREATE TABLE \"My_T\" (\"Col\" int)");
+  ignore (run "INSERT INTO \"My_T\" VALUES (5)");
+  assert (rows_of (run "SELECT \"Col\" FROM \"My_T\"") = [ [ Some "5" ] ]);
+  ok "quoted identifiers preserve case (#31)"
+
+(* #17 — DROP TABLE and TRUNCATE *)
+let test_drop_truncate () =
+  ignore (run "CREATE TABLE dt (id int)");
+  ignore (run "INSERT INTO dt VALUES (1)");
+  ignore (run "INSERT INTO dt VALUES (2)");
+  assert (tag_of (run "TRUNCATE dt") = "TRUNCATE TABLE");
+  assert (rows_of (run "SELECT id FROM dt") = []);
+  assert (tag_of (run "DROP TABLE dt") = "DROP TABLE");
+  assert (Catalog.find "dt" = None);
+  (try ignore (run "DROP TABLE nope"); assert false with Exec.Sql_error ("42P01", _) -> ());
+  assert (tag_of (run "DROP TABLE IF EXISTS nope") = "DROP TABLE");
+  ok "DROP TABLE + TRUNCATE, IF EXISTS (#17)"
+
+(* #30 — EXPLAIN returns the planner's access path as rows *)
+let test_explain () =
+  ignore (run "CREATE TABLE ex (id int)");
+  ignore (run "INSERT INTO ex VALUES (1)");
+  assert (names_of (run "EXPLAIN SELECT * FROM ex") = [ "QUERY PLAN" ]);
+  let rows = rows_of (run "EXPLAIN SELECT * FROM ex") in
+  assert (List.exists (function [ Some m ] -> contains m "seq scan" | _ -> false) rows);
+  (try ignore (run "EXPLAIN DELETE FROM ex"); assert false with Exec.Sql_error ("0A000", _) -> ());
+  ok "EXPLAIN shows the access path, SELECT only (#30)"
+
+(* #19 — MIN/MAX over text (and grouped) *)
+let test_text_minmax () =
+  ignore (run "CREATE TABLE tm (grp text, name text)");
+  List.iter (fun s -> ignore (run s))
+    [ "INSERT INTO tm VALUES ('a', 'banana')"; "INSERT INTO tm VALUES ('a', 'apple')"; "INSERT INTO tm VALUES ('b', 'cherry')" ];
+  assert (rows_of (run "SELECT MIN(name), MAX(name) FROM tm") = [ [ Some "apple"; Some "cherry" ] ]);
+  assert (List.sort compare (rows_of (run "SELECT grp, MAX(name) FROM tm GROUP BY grp"))
+          = List.sort compare [ [ Some "a"; Some "banana" ]; [ Some "b"; Some "cherry" ] ]);
+  ok "text MIN/MAX incl GROUP BY (#19)"
+
+(* #15 (subset) — not-equal operators <> and != *)
+let test_not_equal () =
+  ignore (run "CREATE TABLE ne (id int)");
+  List.iter (fun s -> ignore (run s)) [ "INSERT INTO ne VALUES (1)"; "INSERT INTO ne VALUES (2)"; "INSERT INTO ne VALUES (3)" ];
+  let ids s = List.sort compare (rows_of (run s)) in
+  assert (ids "SELECT id FROM ne WHERE id <> 2" = [ [ Some "1" ]; [ Some "3" ] ]);
+  assert (ids "SELECT id FROM ne WHERE id != 2" = [ [ Some "1" ]; [ Some "3" ] ]);
+  (* still correct when an index exists (must not use the index range path) *)
+  ignore (run "CREATE INDEX ON ne (id)");
+  assert (ids "SELECT id FROM ne WHERE id <> 2" = [ [ Some "1" ]; [ Some "3" ] ]);
+  ok "not-equal <> and != (#15)"
+
+(* #33 — string concatenation operator || *)
+let test_concat () =
+  ignore (run "CREATE TABLE cc (first text, last text)");
+  ignore (run "INSERT INTO cc VALUES ('ada', 'lovelace')");
+  ignore (run "INSERT INTO cc VALUES ('alan', null)");
+  (* column || literal || column *)
+  assert (rows_of (run "SELECT first || ' ' || last FROM cc WHERE first = 'ada'") = [ [ Some "ada lovelace" ] ]);
+  (* NULL operand makes the whole result NULL (PG semantics) *)
+  assert (rows_of (run "SELECT first || last FROM cc WHERE first = 'alan'") = [ [ None ] ]);
+  ok "string concatenation || (#33)"
+
+(* #20 — multi-row INSERT and column lists *)
+let test_multirow_insert () =
+  ignore (run "CREATE TABLE mi (a int, b int, c text)");
+  (* multi-row, positional *)
+  assert (tag_of (run "INSERT INTO mi VALUES (1, 10, 'x'), (2, 20, 'y')") = "INSERT 0 2");
+  (* column list, reordered, missing column defaults to NULL *)
+  assert (tag_of (run "INSERT INTO mi (c, a) VALUES ('z', 3)") = "INSERT 0 1");
+  assert (rows_of (run "SELECT a, b, c FROM mi WHERE a = 3") = [ [ Some "3"; None; Some "z" ] ]);
+  assert (List.length (rows_of (run "SELECT a FROM mi")) = 3);
+  ok "multi-row INSERT + column list (#20)"
+
+(* #32 — ORDER BY ordinal and NULLS FIRST/LAST *)
+let test_order_ordinal_nulls () =
+  ignore (run "CREATE TABLE oo (a int, b text)");
+  List.iter (fun s -> ignore (run s))
+    [ "INSERT INTO oo VALUES (3, 'c')"; "INSERT INTO oo VALUES (1, 'a')"; "INSERT INTO oo VALUES (2, null)" ];
+  (* ORDER BY 1 == ORDER BY the first select item (a) *)
+  assert (rows_of (run "SELECT a FROM oo ORDER BY 1") = [ [ Some "1" ]; [ Some "2" ]; [ Some "3" ] ]);
+  (* explicit NULLS placement on b (a=2 has NULL b) *)
+  assert (rows_of (run "SELECT a FROM oo ORDER BY b NULLS FIRST") = [ [ Some "2" ]; [ Some "1" ]; [ Some "3" ] ]);
+  assert (rows_of (run "SELECT a FROM oo ORDER BY b NULLS LAST") = [ [ Some "1" ]; [ Some "3" ]; [ Some "2" ] ]);
+  ok "ORDER BY ordinal + NULLS FIRST/LAST (#32)"
+
+(* #3 — HAVING with AND/OR (previously accepted only one comparison) *)
+let test_having_andor () =
+  ignore (run "CREATE TABLE hv (grp text, n int)");
+  List.iter (fun s -> ignore (run s))
+    [ "INSERT INTO hv VALUES ('a', 1)"; "INSERT INTO hv VALUES ('a', 2)";
+      "INSERT INTO hv VALUES ('b', 10)";
+      "INSERT INTO hv VALUES ('c', 4)"; "INSERT INTO hv VALUES ('c', 5)" ];
+  let g s = List.sort compare (List.map (function [ Some x ] -> x | _ -> assert false) (rows_of (run s))) in
+  (* a: count2 sum3 · b: count1 sum10 · c: count2 sum9 *)
+  assert (g "SELECT grp FROM hv GROUP BY grp HAVING COUNT(*) > 1 AND SUM(n) > 5" = [ "c" ]);
+  assert (g "SELECT grp FROM hv GROUP BY grp HAVING COUNT(*) > 1 OR SUM(n) > 8" = [ "a"; "b"; "c" ]);
+  ok "HAVING with AND/OR (#3)"
+
 let test_comments () =
   (* line comment to end of input *)
   (match Sql.parse "SELECT id FROM t -- trailing comment" with
@@ -594,6 +707,16 @@ let () =
   test_large_result ();
   test_cost_planner ();
   test_comments ();
+  test_coerce_round ();
+  test_quoted_idents ();
+  test_drop_truncate ();
+  test_explain ();
+  test_text_minmax ();
+  test_not_equal ();
+  test_concat ();
+  test_multirow_insert ();
+  test_order_ordinal_nulls ();
+  test_having_andor ();
   test_params ();
   test_errors ();
   test_persistence ();

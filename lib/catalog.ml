@@ -16,7 +16,7 @@ type typ = Int | Text | Bool | Float
 
 type value = VInt of int | VText of string | VBool of bool | VFloat of float | VNull
 
-type cmp = Eq | Lt | Le | Gt | Ge
+type cmp = Eq | Lt | Le | Gt | Ge | Ne
 
 (* total order over values. Same-type compares directly; int/float compare
    numerically; otherwise a fixed rank keeps the order total (needed for Map). *)
@@ -273,6 +273,7 @@ let lookup_range t col op v =
     let acc = ref [] in (* matching rows, reverse order *)
     let add rs = acc := List.rev_append rs !acc in
     (match op with
+     | Ne -> () (* not a range; planner never routes <> here (seq scan) *)
      | Eq -> ( match VMap.find_opt v m with Some rs -> add rs | None -> ())
      | Gt | Ge ->
        (* keys >= v ascending; for Gt skip the == v group. NULLs sort below v so
@@ -308,7 +309,7 @@ let range_fraction t col op v =
       let clamp f = if f < 0. then 0. else if f > 1. then 1. else f in
       Some
         (clamp
-           (match op with Gt | Ge -> (hi -. x) /. (hi -. lo) | Lt | Le -> (x -. lo) /. (hi -. lo) | Eq -> 0.))
+           (match op with Gt | Ge -> (hi -. x) /. (hi -. lo) | Lt | Le -> (x -. lo) /. (hi -. lo) | Eq -> 0. | Ne -> 1.))
   | _ -> None
 
 (* O(1) amortized: prepend the row, update indexes, append the tuple to the last
@@ -365,6 +366,12 @@ let set_rows name t rows_fwd =
   t.fwd_cache <- None;
   reindex t;
   rewrite_pages name t
+
+(* DROP TABLE: forget the table and remove its on-disk files (schema/heap/WAL). *)
+let drop name t =
+  (match t.wal with Some oc -> (try close_out oc with _ -> ()) | None -> ());
+  Hashtbl.remove tables name;
+  List.iter (fun ext -> try Sys.remove (path name ext) with _ -> ()) [ ".schema"; ".page"; ".wal" ]
 
 (* --- transactions: whole-catalog snapshot / restore --- *)
 

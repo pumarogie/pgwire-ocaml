@@ -33,6 +33,7 @@ let cmp_ok op a b =
   | Catalog.Le -> c <= 0
   | Catalog.Gt -> c > 0
   | Catalog.Ge -> c >= 0
+  | Catalog.Ne -> c <> 0
 
 let col_typ t c =
   match List.assoc_opt c t.Catalog.cols with
@@ -53,7 +54,7 @@ let coerce typ v =
   match (typ, v) with
   | _, Catalog.VNull -> Catalog.VNull
   | Catalog.Int, Catalog.VInt _ -> v
-  | Catalog.Int, Catalog.VFloat f -> Catalog.VInt (int_of_float f)
+  | Catalog.Int, Catalog.VFloat f -> Catalog.VInt (int_of_float (Float.round f)) (* PG rounds, not truncates *)
   | Catalog.Int, Catalog.VText s -> ( match int_of_string_opt s with Some n -> Catalog.VInt n | None -> bad_input s)
   | Catalog.Float, Catalog.VFloat _ -> v
   | Catalog.Float, Catalog.VInt n -> Catalog.VFloat (float_of_int n)
@@ -117,7 +118,7 @@ let bind_cond params = function None -> None | Some p -> Some (bind_pred params 
 
 let bind params stmt =
   match stmt with
-  | Sql.Insert (t, vs) -> Sql.Insert (t, List.map (bind_pvalue params) vs)
+  | Sql.Insert (t, cols, rows) -> Sql.Insert (t, cols, List.map (List.map (bind_pvalue params)) rows)
   | Sql.Select s ->
     Sql.Select
       { s with
@@ -139,7 +140,7 @@ let count_params stmt =
   in
   let scan_cond = function Some p -> scan_pred p | None -> () in
   (match stmt with
-   | Sql.Insert (_, vs) -> List.iter scan vs
+   | Sql.Insert (_, _, rows) -> List.iter (List.iter scan) rows
    | Sql.Select s ->
      scan_cond s.Sql.where;
      Option.iter scan s.Sql.limit;
@@ -195,12 +196,32 @@ let agg_name = function
   | Sql.Max -> "max"
   | Sql.Avg -> "avg"
 
-(* plain (non-aggregate) projection -> (name, typ, row index) *)
-let plain_cols t items =
+(* plain (non-aggregate) projection -> (output name, typ, render : row -> cell,
+   source index option). The render closure resolves column indices once and
+   also covers computed items like `a || b`; the index (None for computed items)
+   lets DISTINCT dedup on raw values before rendering. *)
+let proj_fns t items =
   List.concat_map
     (function
-      | Sql.Star -> List.mapi (fun i (c, ty) -> (c, ty, i)) t.Catalog.cols
-      | Sql.Col c -> [ (c, col_typ t c, col_idx t c) ]
+      | Sql.Star -> List.mapi (fun i (c, ty) -> (c, ty, (fun row -> text_of_value row.(i)), Some i)) t.Catalog.cols
+      | Sql.Col c -> let i = col_idx t c in [ (c, col_typ t c, (fun row -> text_of_value row.(i)), Some i) ]
+      | Sql.Concat parts ->
+        let renderers =
+          List.map
+            (function
+              | Sql.CPcol c -> let i = col_idx t c in fun row -> text_of_value row.(i)
+              | Sql.CPval v -> let s = text_of_value v in fun _ -> s)
+            parts
+        in
+        (* `||` yields NULL if any operand is NULL (PostgreSQL semantics) *)
+        let render row =
+          let rec go acc = function
+            | [] -> Some acc
+            | f :: rest -> ( match f row with None -> None | Some s -> go (acc ^ s) rest)
+          in
+          go "" renderers
+        in
+        [ ("?column?", Catalog.Text, render, None) ]
       | Sql.Agg _ -> raise (Sql_error ("42601", "aggregate requires GROUP BY or an aggregate-only select")))
     items
 
@@ -208,6 +229,7 @@ let agg_desc t items =
   List.map
     (function
       | Sql.Star -> raise (Sql_error ("42601", "cannot use * with aggregates"))
+      | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported alongside aggregates"))
       | Sql.Col c -> col_desc c (col_typ t c)
       | Sql.Agg (Sql.Count, _) -> col_desc "count" Catalog.Int
       | Sql.Agg (Sql.Avg, _) -> col_desc "avg" Catalog.Float
@@ -217,7 +239,7 @@ let agg_desc t items =
 
 let select_output_desc t sel =
   if is_agg_query sel then agg_desc t sel.Sql.items
-  else List.map (fun (c, ty, _) -> col_desc c ty) (plain_cols t sel.Sql.items)
+  else List.map (fun (c, ty, _, _) -> col_desc c ty) (proj_fns t sel.Sql.items)
 
 (* --- qualified column references + JOIN --- *)
 
@@ -250,6 +272,7 @@ let normalize_single tname sel =
         (function
           | Sql.Col c -> Sql.Col (sc c)
           | Sql.Agg (a, Some c) -> Sql.Agg (a, Some (sc c))
+          | Sql.Concat parts -> Sql.Concat (List.map (function Sql.CPcol c -> Sql.CPcol (sc c) | x -> x) parts)
           | x -> x)
         sel.Sql.items;
     Sql.where = (match sel.Sql.where with Some p -> Some (strip_pred sc p) | None -> None);
@@ -368,6 +391,7 @@ let run_join ~notice name1 name2 (lref, rref) kind sel =
       (function
         | Sql.Star -> List.mapi (fun i (_, c, ty) -> (c, ty, i)) schema
         | Sql.Col s -> let i = resolve s in let _, c, ty = List.nth schema i in [ (c, ty, i) ]
+        | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported with JOIN"))
         | Sql.Agg _ -> raise (Sql_error ("0A000", "aggregates are not supported with JOIN")))
       sel.Sql.items
   in
@@ -407,8 +431,7 @@ let describe stmt =
 (* --- executing SELECT --- *)
 
 let run_plain ?(presorted = false) t sel candidates =
-  let cols = plain_cols t sel.Sql.items in
-  let idxs = List.map (fun (_, _, i) -> i) cols in
+  let projs = proj_fns t sel.Sql.items in
   let candidates =
     if presorted then candidates (* rows already came ordered from the index *)
     else
@@ -416,31 +439,46 @@ let run_plain ?(presorted = false) t sel candidates =
       | None -> candidates
       | Some o ->
         let i = col_idx t o.Sql.by in
-        let s = List.stable_sort (fun r1 r2 -> Catalog.compare_value (r1.(i)) (r2.(i))) candidates in
-        if o.Sql.desc then List.rev s else s
+        (* NULLS placement: explicit override, else legacy default (first for ASC,
+           last for DESC — preserved to avoid changing prior results) *)
+        let nulls_first = match o.Sql.nulls_first with Some b -> b | None -> not o.Sql.desc in
+        let cmp r1 r2 =
+          let a = r1.(i) and b = r2.(i) in
+          if a = Catalog.VNull && b = Catalog.VNull then 0
+          else if a = Catalog.VNull then if nulls_first then -1 else 1
+          else if b = Catalog.VNull then if nulls_first then 1 else -1
+          else let c = Catalog.compare_value a b in if o.Sql.desc then -c else c
+        in
+        List.stable_sort cmp candidates
   in
-  (* DISTINCT on the selected column VALUES, before rendering, so duplicates are
-     never stringified (big win when few distinct rows survive). Then LIMIT. *)
+  let desc = List.map (fun (c, ty, _, _) -> col_desc c ty) projs in
+  (* DISTINCT fast path: if every item is a plain column, dedup on raw VALUES
+     before rendering (so a low-cardinality DISTINCT never stringifies every
+     row). If any item is computed (e.g. `||`), dedup on the rendered rows. *)
+  let idxs = List.map (fun (_, _, _, i) -> i) projs in
+  let value_distinct = sel.Sql.distinct && List.for_all (fun i -> i <> None) idxs in
   let candidates =
-    if sel.Sql.distinct then begin
+    if value_distinct then begin
+      let ks = List.filter_map Fun.id idxs in
       let seen = Hashtbl.create 256 in
       tfilter
         (fun row ->
-          let k = List.map (fun i -> row.(i)) idxs in
+          let k = List.map (fun i -> row.(i)) ks in
           if Hashtbl.mem seen k then false else (Hashtbl.add seen k (); true))
         candidates
     end
     else candidates
   in
-  let candidates = slice sel candidates in
-  let desc = List.map (fun (c, ty, _) -> col_desc c ty) cols in
-  let rows = tmap (fun row -> List.map (fun i -> text_of_value row.(i)) idxs) candidates in
+  let rows = tmap (fun row -> List.map (fun (_, _, f, _) -> f row) projs) candidates in
+  let rows = if sel.Sql.distinct && not value_distinct then dedupe rows else rows in
+  let rows = slice sel rows in
   Rows (desc, rows)
 
 (* one accumulator (update-with-row, finalize-to-value) for a select/HAVING item.
    Stateful — create a fresh one per group. *)
 let agg_maker t = function
   | Sql.Star -> raise (Sql_error ("42601", "cannot use * with aggregates"))
+  | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported alongside aggregates"))
   | Sql.Col c ->
     let i = col_idx t c in
     let v = ref Catalog.VNull and got = ref false in
@@ -451,6 +489,19 @@ let agg_maker t = function
   | Sql.Agg (Sql.Count, Some c) ->
     let i = col_idx t c and n = ref 0 in
     ((fun row -> if row.(i) <> Catalog.VNull then incr n), fun () -> Catalog.VInt !n)
+  | Sql.Agg (((Sql.Min | Sql.Max) as a), Some c) when col_typ t c <> Catalog.Int && col_typ t c <> Catalog.Float ->
+    (* MIN/MAX over any orderable type (text, bool) via compare_value *)
+    let i = col_idx t c in
+    let best = ref Catalog.VNull in
+    let upd row =
+      let v = row.(i) in
+      if v <> Catalog.VNull then
+        if !best = Catalog.VNull then best := v
+        else
+          let d = Catalog.compare_value v !best in
+          if (a = Sql.Min && d < 0) || (a = Sql.Max && d > 0) then best := v
+    in
+    (upd, fun () -> !best)
   | Sql.Agg (((Sql.Sum | Sql.Min | Sql.Max | Sql.Avg) as a), Some c) ->
     let i = col_idx t c and ty = col_typ t c in
     if ty <> Catalog.Int && ty <> Catalog.Float then
@@ -482,22 +533,42 @@ let agg_maker t = function
     (upd, fin)
   | Sql.Agg (_, None) -> raise (Sql_error ("42601", "aggregate function requires a column argument"))
 
+(* flatten a HAVING tree to its comparison atoms, left to right *)
+let rec hcond_atoms = function
+  | Sql.HCmp (it, op, pv) -> [ (it, op, pv) ]
+  | Sql.HAnd (a, b) | Sql.HOr (a, b) -> hcond_atoms a @ hcond_atoms b
+
+(* evaluate a HAVING tree given the finalized atom values in left-to-right order.
+   Does not short-circuit, so the atom index stays in sync with [finals]. *)
+let eval_having hc finals =
+  let idx = ref 0 in
+  let rec go = function
+    | Sql.HCmp (_, op, pv) ->
+      let v = finals.(!idx) in
+      incr idx;
+      let w = deref pv in
+      v <> Catalog.VNull && w <> Catalog.VNull && cmp_ok op v w
+    | Sql.HAnd (a, b) -> let ra = go a in let rb = go b in ra && rb
+    | Sql.HOr (a, b) -> let ra = go a in let rb = go b in ra || rb
+  in
+  go hc
+
 (* fused hash aggregation: a single pass builds one accumulator set per group
    (like PostgreSQL's HashAggregate) — no intermediate per-group row lists.
    A sample row per group serves Col items and ORDER BY. *)
 let run_aggregate t sel candidates =
   let items = sel.Sql.items in
   let key_idx = match sel.Sql.group_by with Some g -> Some (col_idx t g) | None -> None in
-  let having_item = match sel.Sql.having with Some (it, _, _) -> Some it | None -> None in
+  let having_atoms = match sel.Sql.having with Some h -> hcond_atoms h | None -> [] in
   let tbl = Hashtbl.create 256 and order = ref [] in
   let make row =
     let item_accs = List.map (agg_maker t) items in
-    let hv = match having_item with Some it -> Some (agg_maker t it) | None -> None in
-    (item_accs, hv, row)
+    let hvs = List.map (fun (it, _, _) -> agg_maker t it) having_atoms in
+    (item_accs, hvs, row)
   in
-  let update (item_accs, hv, _) row =
+  let update (item_accs, hvs, _) row =
     List.iter (fun (upd, _) -> upd row) item_accs;
-    match hv with Some (upd, _) -> upd row | None -> ()
+    List.iter (fun (upd, _) -> upd row) hvs
   in
   (match key_idx with
    | None ->
@@ -520,13 +591,12 @@ let run_aggregate t sel candidates =
   let keys =
     match sel.Sql.having with
     | None -> keys
-    | Some (_, op, pv) ->
-      let w = deref pv in
+    | Some hc ->
       List.filter
         (fun k ->
-          match Hashtbl.find tbl k with
-          | _, Some (_, fin), _ -> let v = fin () in v <> Catalog.VNull && w <> Catalog.VNull && cmp_ok op v w
-          | _ -> true)
+          let _, hvs, _ = Hashtbl.find tbl k in
+          let finals = Array.of_list (List.map (fun (_, fin) -> fin ()) hvs) in
+          eval_having hc finals)
         keys
   in
   let keys =
@@ -545,16 +615,30 @@ let run_aggregate t sel candidates =
   let rows = slice sel rows in
   Rows (agg_desc t sel.Sql.items, rows)
 
+(* resolve ORDER BY <n> to the underlying plain column of the nth select item *)
+let resolve_order sel =
+  match sel.Sql.order_by with
+  | Some ({ Sql.ordinal = Some n; _ } as o) ->
+    let items = Array.of_list sel.Sql.items in
+    if n < 1 || n > Array.length items then raise (Sql_error ("42P10", "ORDER BY position out of range"));
+    (match items.(n - 1) with
+     | Sql.Col c -> { sel with Sql.order_by = Some { o with Sql.by = c; ordinal = None } }
+     | _ -> raise (Sql_error ("0A000", "ORDER BY ordinal must reference a plain column")))
+  | _ -> sel
+
 (* single-table SELECT: planner picks the access path, then project/aggregate *)
 let run_table ~notice tname sel =
+  let sel = resolve_order sel in
   match Catalog.find tname with
   | None -> raise (Sql_error ("42P01", Printf.sprintf "relation \"%s\" does not exist" tname))
   | Some t -> (
     (* ORDER BY on an indexed column with no WHERE and a plain select: read rows
-       already ordered from the index and skip the sort entirely. *)
+       already ordered from the index and skip the sort entirely. Skipped when an
+       explicit NULLS placement is requested (index order is fixed). *)
     let ordered =
       match (sel.Sql.where, sel.Sql.order_by) with
-      | None, Some o when (not (is_agg_query sel)) && Catalog.find_index t o.Sql.by <> None ->
+      | None, Some o
+        when (not (is_agg_query sel)) && o.Sql.nulls_first = None && Catalog.find_index t o.Sql.by <> None ->
         (* push LIMIT down as a top-k, unless DISTINCT (which changes the count).
            With OFFSET we need offset+limit rows, then run_plain trims exactly. *)
         let limit =
@@ -582,7 +666,8 @@ let run_table ~notice tname sel =
         (* cost-based: index-range only when the predicate is selective (matches
            a small fraction); a non-selective range is cheaper as a seq scan *)
         | Some (Sql.Cmp (c, op, pv))
-          when op <> Catalog.Eq && deref pv <> Catalog.VNull && Catalog.find_index t c <> None
+          when (match op with Catalog.Lt | Catalog.Le | Catalog.Gt | Catalog.Ge -> true | _ -> false)
+               && deref pv <> Catalog.VNull && Catalog.find_index t c <> None
                && (match Catalog.range_fraction t c op (deref pv) with Some f -> f <= 0.33 | None -> true) ->
           notice (Printf.sprintf "index range scan on %s.%s" tname c);
           Catalog.lookup_range t c op (deref pv)
@@ -599,9 +684,28 @@ let run_table ~notice tname sel =
 
 (* [notice] receives the chosen access path ("seq scan" / "index scan"), which
    the server relays to the client as a NOTICE — the query planner made visible. *)
-let run ?(notice = fun _ -> ()) stmt =
+let rec run ?(notice = fun _ -> ()) stmt =
   match stmt with
   | Sql.Other tag -> Tag tag
+  | Sql.Drop (name, if_exists) -> (
+    match Catalog.find name with
+    | Some t -> Catalog.drop name t; Tag "DROP TABLE"
+    | None ->
+      if if_exists then Tag "DROP TABLE"
+      else raise (Sql_error ("42P01", Printf.sprintf "relation \"%s\" does not exist" name)))
+  | Sql.Truncate name -> (
+    match Catalog.find name with
+    | None -> raise (Sql_error ("42P01", Printf.sprintf "relation \"%s\" does not exist" name))
+    | Some t -> Catalog.set_rows name t []; Tag "TRUNCATE TABLE")
+  | Sql.Explain inner ->
+    (* run the planner and surface its access-path notices as the plan.
+       Restricted to SELECT so EXPLAIN never mutates. *)
+    (match inner with
+     | Sql.Select _ -> ()
+     | _ -> raise (Sql_error ("0A000", "EXPLAIN is only supported for SELECT")));
+    let plan = ref [] in
+    ignore (run ~notice:(fun m -> plan := [ Some m ] :: !plan) inner);
+    Rows ([ col_desc "QUERY PLAN" Catalog.Text ], List.rev !plan)
   | Sql.Create (name, cols) ->
     (try Catalog.create name cols with Failure m -> raise (Sql_error ("42P07", m)));
     Tag "CREATE TABLE"
@@ -610,16 +714,33 @@ let run ?(notice = fun _ -> ()) stmt =
      | None -> raise (Sql_error ("42P01", Printf.sprintf "relation \"%s\" does not exist" tbl))
      | Some _ -> ( try Catalog.create_index tbl col with Failure m -> raise (Sql_error ("42703", m))));
     Tag "CREATE INDEX"
-  | Sql.Insert (name, vals) -> (
+  | Sql.Insert (name, cols, rows) -> (
     match Catalog.find name with
     | None -> raise (Sql_error ("42P01", Printf.sprintf "relation \"%s\" does not exist" name))
     | Some t ->
-      let vals = List.map deref vals in
-      if List.length vals <> List.length t.Catalog.cols then
-        raise (Sql_error ("42601", "INSERT has wrong number of values"));
-      let vals = List.map2 (fun (_, ty) v -> coerce ty v) t.Catalog.cols vals in
-      Catalog.insert name t (Array.of_list vals);
-      Tag "INSERT 0 1")
+      let ncols = List.length t.Catalog.cols in
+      (* target column index for each provided value; None = positional (all cols) *)
+      let targets =
+        match cols with
+        | None -> None
+        | Some names -> Some (List.map (fun c -> col_idx t c) names)
+      in
+      let build vals =
+        let vals = List.map deref vals in
+        match targets with
+        | None ->
+          if List.length vals <> ncols then raise (Sql_error ("42601", "INSERT has wrong number of values"));
+          Array.of_list (List.map2 (fun (_, ty) v -> coerce ty v) t.Catalog.cols vals)
+        | Some idxs ->
+          if List.length vals <> List.length idxs then
+            raise (Sql_error ("42601", "INSERT has more expressions than target columns"));
+          (* unspecified columns default to NULL *)
+          let arr = Array.make ncols Catalog.VNull in
+          List.iter2 (fun i v -> let (_, ty) = List.nth t.Catalog.cols i in arr.(i) <- coerce ty v) idxs vals;
+          arr
+      in
+      List.iter (fun r -> Catalog.insert name t (build r)) rows;
+      Tag (Printf.sprintf "INSERT 0 %d" (List.length rows)))
   | Sql.Delete (name, where) -> (
     match Catalog.find name with
     | None -> raise (Sql_error ("42P01", Printf.sprintf "relation \"%s\" does not exist" name))
@@ -648,6 +769,7 @@ let run ?(notice = fun _ -> ()) stmt =
       Catalog.set_rows name t (tmap apply (Catalog.rows t));
       Tag (Printf.sprintf "UPDATE %d" !count))
   | Sql.Select sel -> (
+    let sel = resolve_order sel in
     match sel.Sql.from with
     | Sql.Table tname -> run_table ~notice tname (normalize_single tname sel)
     | Sql.Join (a, b, on, k) -> run_join ~notice a b on k sel)
