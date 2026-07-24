@@ -20,6 +20,7 @@ type concpart = CPcol of string | CPval of Catalog.value
 type sel_item = Star | Col of string | Agg of agg * string option (* arg None = star form *)
               | Concat of concpart list (* a || b || 'x' *)
               | Const of Catalog.value (* literal in the select list, e.g. SELECT 1 *)
+              | Alias of sel_item * string (* item AS name — renames the output column *)
 type order = {
   by : string; (* column name; "" when an ordinal is used *)
   ordinal : int option; (* ORDER BY 1 -> select-list position *)
@@ -319,34 +320,38 @@ let parse sql =
     Insert (t, cols, List.rev !rows)
   in
   let sel_item () =
-    match peek () with
-    | Some (TSym '*') -> advance (); Star
-    | Some (TIdent w) when is_agg (String.lowercase_ascii w) && peek2 () = Some (TSym '(') ->
-      let a = agg_of (String.lowercase_ascii w) in
-      advance ();
-      sym '(';
-      let arg = match peek () with Some (TSym '*') -> advance (); None | _ -> Some (colname ()) in
-      sym ')';
-      Agg (a, arg)
-    | Some (TStr _ | TNum _ | TFloat _ | TIdent _ | TQuoted _) ->
-      (* a column or literal, possibly the start of a `||` concatenation *)
-      let operand () =
-        match peek () with
-        | Some (TStr s) -> advance (); CPval (Catalog.VText s)
-        | Some (TNum n) -> advance (); CPval (Catalog.VInt n)
-        | Some (TFloat f) -> advance (); CPval (Catalog.VFloat f)
-        | Some (TIdent _ | TQuoted _) -> CPcol (colname ())
-        | _ -> failwith "expected a concatenation operand"
-      in
-      let first = operand () in
-      if peek () = Some TConcat then begin
-        let parts = ref [ first ] in
-        while peek () = Some TConcat do advance (); parts := operand () :: !parts done;
-        Concat (List.rev !parts)
-      end
-      (* a lone column, or a lone literal (SELECT 1) *)
-      else (match first with CPcol c -> Col c | CPval v -> Const v)
-    | _ -> failwith "expected column, '*', or aggregate"
+    let base =
+      match peek () with
+      | Some (TSym '*') -> advance (); Star
+      | Some (TIdent w) when is_agg (String.lowercase_ascii w) && peek2 () = Some (TSym '(') ->
+        let a = agg_of (String.lowercase_ascii w) in
+        advance ();
+        sym '(';
+        let arg = match peek () with Some (TSym '*') -> advance (); None | _ -> Some (colname ()) in
+        sym ')';
+        Agg (a, arg)
+      | Some (TStr _ | TNum _ | TFloat _ | TIdent _ | TQuoted _) ->
+        (* a column or literal, possibly the start of a `||` concatenation *)
+        let operand () =
+          match peek () with
+          | Some (TStr s) -> advance (); CPval (Catalog.VText s)
+          | Some (TNum n) -> advance (); CPval (Catalog.VInt n)
+          | Some (TFloat f) -> advance (); CPval (Catalog.VFloat f)
+          | Some (TIdent _ | TQuoted _) -> CPcol (colname ())
+          | _ -> failwith "expected a concatenation operand"
+        in
+        let first = operand () in
+        if peek () = Some TConcat then begin
+          let parts = ref [ first ] in
+          while peek () = Some TConcat do advance (); parts := operand () :: !parts done;
+          Concat (List.rev !parts)
+        end
+        (* a lone column, or a lone literal (SELECT 1) *)
+        else (match first with CPcol c -> Col c | CPval v -> Const v)
+      | _ -> failwith "expected column, '*', or aggregate"
+    in
+    (* optional "AS name" renames the output column *)
+    if opt_kw "as" then Alias (base, name ()) else base
   in
   let parse_select () =
     expect_kw "select";
