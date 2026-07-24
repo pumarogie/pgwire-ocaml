@@ -35,7 +35,7 @@ let test_tuple_codec () =
 
 let test_parser () =
   (match Sql.parse "SELECT * FROM t" with
-   | Sql.Select { distinct = false; items = [ Sql.Star ]; from = Sql.Table "t"; where = None; group_by = None; having = None; order_by = None; limit = None } -> ()
+   | Sql.Select { distinct = false; items = [ Sql.Star ]; from = Sql.Table "t"; where = None; group_by = None; having = None; order_by = None; limit = None; offset = None } -> ()
    | _ -> assert false);
   (match Sql.parse "SELECT a.x FROM a JOIN b ON a.k = b.k" with
    | Sql.Select { items = [ Sql.Col "a.x" ]; from = Sql.Join ("a", "b", ("a.k", "b.k"), Sql.Inner); _ } -> ()
@@ -57,7 +57,7 @@ let test_parser () =
    | Sql.Select { items = [ Sql.Col "a"; Sql.Agg (Sql.Sum, Some "b") ]; group_by = Some "a"; _ } -> ()
    | _ -> assert false);
   (match Sql.parse "SELECT * FROM t ORDER BY a DESC LIMIT 5" with
-   | Sql.Select { order_by = Some { Sql.by = "a"; desc = true }; limit = Some 5; _ } -> ()
+   | Sql.Select { order_by = Some { Sql.by = "a"; desc = true }; limit = Some (Sql.Lit (Catalog.VInt 5)); _ } -> ()
    | _ -> assert false);
   ok "parser: select/insert/param/index/aggregate/order/limit/other"
 
@@ -111,6 +111,16 @@ let test_order_limit () =
   assert (List.length (rows_of (run "SELECT id FROM t_agg LIMIT 1")) = 1);
   assert (rows_of (run "SELECT id FROM t_agg WHERE team = 'red' ORDER BY score ASC") = [ [ Some "1" ]; [ Some "2" ] ]);
   ok "order by asc/desc + limit + where combo"
+
+let test_limit_offset () =
+  (* t_agg ordered by score asc => ids 1(10), 3(20), 2(30) *)
+  assert (rows_of (run "SELECT id FROM t_agg ORDER BY score ASC LIMIT 2 OFFSET 1") = [ [ Some "3" ]; [ Some "2" ] ]);
+  assert (rows_of (run "SELECT id FROM t_agg ORDER BY score ASC OFFSET 2") = [ [ Some "2" ] ]);
+  assert (rows_of (run "SELECT id FROM t_agg ORDER BY score ASC LIMIT 1") = [ [ Some "1" ] ]);
+  (* parameterized LIMIT: LIMIT $1 supplied via Bind *)
+  let stmt = Exec.bind [| Catalog.VInt 2 |] (Sql.parse "SELECT id FROM t_agg ORDER BY score ASC LIMIT $1") in
+  assert (rows_of (Exec.run stmt) = [ [ Some "1" ]; [ Some "3" ] ]);
+  ok "limit/offset + parameterized LIMIT $1"
 
 (* --- executor + query planner --- *)
 
@@ -550,6 +560,7 @@ let () =
   test_aggregates ();
   test_range ();
   test_order_limit ();
+  test_limit_offset ();
   test_multipage ();
   test_mutations ();
   test_join ();
