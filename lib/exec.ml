@@ -185,9 +185,12 @@ let compile_cond t = function None -> (fun _ -> true) | Some p -> compile_pred t
 
 (* --- SELECT output shape --- *)
 
+(* the underlying item, ignoring any AS alias wrapper *)
+let rec base_item = function Sql.Alias (it, _) -> base_item it | it -> it
+
 let is_agg_query sel =
   sel.Sql.group_by <> None || sel.Sql.having <> None
-  || List.exists (function Sql.Agg _ -> true | _ -> false) sel.Sql.items
+  || List.exists (fun it -> match base_item it with Sql.Agg _ -> true | _ -> false) sel.Sql.items
 
 let agg_name = function
   | Sql.Count -> "count"
@@ -200,11 +203,12 @@ let agg_name = function
    source index option). The render closure resolves column indices once and
    also covers computed items like `a || b`; the index (None for computed items)
    lets DISTINCT dedup on raw values before rendering. *)
-let proj_fns t items =
+let rec proj_fns t items =
   List.concat_map
     (function
       | Sql.Star -> List.mapi (fun i (c, ty) -> (c, ty, (fun row -> text_of_value row.(i)), Some i)) t.Catalog.cols
       | Sql.Col c -> let i = col_idx t c in [ (c, col_typ t c, (fun row -> text_of_value row.(i)), Some i) ]
+      | Sql.Alias (it, a) -> List.map (fun (_, ty, f, i) -> (a, ty, f, i)) (proj_fns t [ it ])
       | Sql.Concat parts ->
         let renderers =
           List.map
@@ -226,13 +230,14 @@ let proj_fns t items =
       | Sql.Agg _ -> raise (Sql_error ("42601", "aggregate requires GROUP BY or an aggregate-only select")))
     items
 
-let agg_desc t items =
+let rec agg_desc t items =
   List.map
     (function
       | Sql.Star -> raise (Sql_error ("42601", "cannot use * with aggregates"))
       | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported alongside aggregates"))
       | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items require no FROM clause"))
       | Sql.Col c -> col_desc c (col_typ t c)
+      | Sql.Alias (it, a) -> let (_, oid, sz) = List.hd (agg_desc t [ it ]) in (a, oid, sz)
       | Sql.Agg (Sql.Count, _) -> col_desc "count" Catalog.Int
       | Sql.Agg (Sql.Avg, _) -> col_desc "avg" Catalog.Float
       | Sql.Agg (a, Some c) -> col_desc (agg_name a) (col_typ t c) (* SUM/MIN/MAX keep the column type *)
@@ -284,11 +289,14 @@ let normalize_single tname sel =
     sel with
     Sql.items =
       List.map
-        (function
-          | Sql.Col c -> Sql.Col (sc c)
-          | Sql.Agg (a, Some c) -> Sql.Agg (a, Some (sc c))
-          | Sql.Concat parts -> Sql.Concat (List.map (function Sql.CPcol c -> Sql.CPcol (sc c) | x -> x) parts)
-          | x -> x)
+        (let rec strip = function
+           | Sql.Col c -> Sql.Col (sc c)
+           | Sql.Agg (a, Some c) -> Sql.Agg (a, Some (sc c))
+           | Sql.Concat parts -> Sql.Concat (List.map (function Sql.CPcol c -> Sql.CPcol (sc c) | x -> x) parts)
+           | Sql.Alias (it, a) -> Sql.Alias (strip it, a)
+           | x -> x
+         in
+         strip)
         sel.Sql.items;
     Sql.where = (match sel.Sql.where with Some p -> Some (strip_pred sc p) | None -> None);
     Sql.order_by = (match sel.Sql.order_by with Some o -> Some { o with Sql.by = sc o.Sql.by } | None -> None);
@@ -401,15 +409,15 @@ let run_join ~notice name1 name2 (lref, rref) kind sel =
       notice (Printf.sprintf "nested loop join %s x %s" name1 name2);
       nested_loop_join ()
   in
-  let proj =
-    List.concat_map
-      (function
-        | Sql.Star -> List.mapi (fun i (_, c, ty) -> (c, ty, i)) schema
-        | Sql.Col s -> let i = resolve s in let _, c, ty = List.nth schema i in [ (c, ty, i) ]
-        | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported with JOIN"))
-        | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items are not supported with JOIN"))
-        | Sql.Agg _ -> raise (Sql_error ("0A000", "aggregates are not supported with JOIN")))
-      sel.Sql.items
+  let rec proj_of = function
+    | Sql.Star -> List.mapi (fun i (_, c, ty) -> (c, ty, i)) schema
+    | Sql.Col s -> let i = resolve s in let _, c, ty = List.nth schema i in [ (c, ty, i) ]
+    | Sql.Alias (it, a) -> List.map (fun (_, ty, i) -> (a, ty, i)) (proj_of it)
+    | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported with JOIN"))
+    | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items are not supported with JOIN"))
+    | Sql.Agg _ -> raise (Sql_error ("0A000", "aggregates are not supported with JOIN"))
+  in
+  let proj = List.concat_map proj_of sel.Sql.items
   in
   let rows =
     match sel.Sql.where with
@@ -493,10 +501,11 @@ let run_plain ?(presorted = false) t sel candidates =
 
 (* one accumulator (update-with-row, finalize-to-value) for a select/HAVING item.
    Stateful — create a fresh one per group. *)
-let agg_maker t = function
+let rec agg_maker t = function
   | Sql.Star -> raise (Sql_error ("42601", "cannot use * with aggregates"))
   | Sql.Concat _ -> raise (Sql_error ("0A000", "|| is not supported alongside aggregates"))
   | Sql.Const _ -> raise (Sql_error ("0A000", "constant select items require no FROM clause"))
+  | Sql.Alias (it, _) -> agg_maker t it (* alias only renames the column, not the value *)
   | Sql.Col c ->
     let i = col_idx t c in
     let v = ref Catalog.VNull and got = ref false in

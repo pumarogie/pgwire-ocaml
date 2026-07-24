@@ -112,6 +112,20 @@ let test_order_limit () =
   assert (rows_of (run "SELECT id FROM t_agg WHERE team = 'red' ORDER BY score ASC") = [ [ Some "1" ]; [ Some "2" ] ]);
   ok "order by asc/desc + limit + where combo"
 
+let names_of = function Exec.Rows (desc, _) -> List.map (fun (n, _, _) -> n) desc | Exec.Tag _ -> assert false
+
+let test_aliases () =
+  (* parser attaches the alias to the item *)
+  (match Sql.parse "SELECT id AS ident FROM t" with
+   | Sql.Select { items = [ Sql.Alias (Sql.Col "id", "ident") ]; _ } -> ()
+   | _ -> assert false);
+  (* alias drives the RowDescription column name; values unchanged *)
+  assert (names_of (run "SELECT score AS points FROM t_agg") = [ "points" ]);
+  (* alias on an aggregate *)
+  let r = run "SELECT COUNT(*) AS n FROM t_agg" in
+  assert (names_of r = [ "n" ] && rows_of r = [ [ Some "3" ] ]);
+  ok "column aliases: SELECT x AS y renames the output column"
+
 let test_limit_offset () =
   (* t_agg ordered by score asc => ids 1(10), 3(20), 2(30) *)
   assert (rows_of (run "SELECT id FROM t_agg ORDER BY score ASC LIMIT 2 OFFSET 1") = [ [ Some "3" ]; [ Some "2" ] ]);
@@ -725,6 +739,7 @@ let () =
   test_order_ordinal_nulls ();
   test_having_andor ();
   test_select_no_from ();
+  test_aliases ();
   test_params ();
   test_errors ();
   test_persistence ();
