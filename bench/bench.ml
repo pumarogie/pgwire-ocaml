@@ -63,6 +63,7 @@ let bench_reads n =
   line "aggregate COUNT+SUM+AVG" scale (avg_ms reps (fun () -> query "SELECT COUNT(*), SUM(id), AVG(id) FROM t")) "";
   line "GROUP BY g, COUNT(*)" scale (avg_ms reps (fun () -> query "SELECT g, COUNT(*) FROM t GROUP BY g")) "10 groups";
   line "ORDER BY id DESC LIMIT 10" scale (avg_ms reps (fun () -> query "SELECT id FROM t ORDER BY id DESC LIMIT 10")) "";
+  line "paginate LIMIT 10 OFFSET n/2" scale (avg_ms reps (fun () -> query (Printf.sprintf "SELECT id FROM t ORDER BY id LIMIT 10 OFFSET %d" (n / 2)))) "index top-k";
   line "SELECT DISTINCT g" scale (avg_ms reps (fun () -> query "SELECT DISTINCT g FROM t")) "";
   line "compound WHERE (AND/OR)" scale (avg_ms reps (fun () -> query "SELECT id FROM t WHERE id > 10 AND g = 5 OR id < 3")) ""
 
