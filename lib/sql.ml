@@ -49,7 +49,8 @@ and select = {
   group_by : string option;
   having : (sel_item * Catalog.cmp * pvalue) option; (* filter groups by an aggregate/column *)
   order_by : order option;
-  limit : int option;
+  limit : pvalue option; (* pvalue so LIMIT $1 works; resolved to an int at exec *)
+  offset : pvalue option;
 }
 
 (* --- lexer --- *)
@@ -336,14 +337,10 @@ let parse sql =
         Some { by; desc })
       else None
     in
-    let limit =
-      if opt_kw "limit" then
-        match peek () with
-        | Some (TNum n) -> advance (); Some n
-        | _ -> failwith "expected a number after LIMIT"
-      else None
-    in
-    Select { distinct; items = List.rev !items; from; where; group_by; having; order_by; limit }
+    (* LIMIT/OFFSET take an integer literal or a $n bind param *)
+    let limit = if opt_kw "limit" then Some (value ()) else None in
+    let offset = if opt_kw "offset" then Some (value ()) else None in
+    Select { distinct; items = List.rev !items; from; where; group_by; having; order_by; limit; offset }
   in
   let parse_delete () =
     expect_kw "delete";
@@ -414,6 +411,6 @@ let demo () =
    | _ -> assert false);
   (match parse "SELECT COUNT(*), SUM(a) FROM t GROUP BY b ORDER BY a DESC LIMIT 3" with
    | Select { items = [ Agg (Count, None); Agg (Sum, Some "a") ]; group_by = Some "b";
-              order_by = Some { by = "a"; desc = true }; limit = Some 3; _ } -> ()
+              order_by = Some { by = "a"; desc = true }; limit = Some (Lit (Catalog.VInt 3)); _ } -> ()
    | _ -> assert false);
   print_endline "sql: ok"

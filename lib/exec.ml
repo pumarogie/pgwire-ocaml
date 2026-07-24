@@ -68,6 +68,18 @@ let coerce typ v =
   | _ -> raise (Sql_error ("42804", "column type mismatch"))
 
 let rec take n = function [] -> [] | _ when n <= 0 -> [] | x :: tl -> x :: take (n - 1) tl
+let rec tdrop n l = if n <= 0 then l else match l with [] -> [] | _ :: tl -> tdrop (n - 1) tl
+
+(* resolve a LIMIT/OFFSET pvalue (params already bound) to a non-negative int *)
+let pv_int what = function
+  | None -> None
+  | Some (Sql.Lit (Catalog.VInt n)) when n >= 0 -> Some n
+  | Some _ -> raise (Sql_error ("2201W", Printf.sprintf "%s must be a non-negative integer" what))
+
+(* apply OFFSET then LIMIT to a row list *)
+let slice sel rows =
+  let rows = match pv_int "OFFSET" sel.Sql.offset with None -> rows | Some n -> tdrop n rows in
+  match pv_int "LIMIT" sel.Sql.limit with None -> rows | Some n -> take n rows
 
 (* Tail-recursive, order-preserving list ops. Used on ROW-scale lists so a large
    result set can't overflow the connection thread's small stack — the stdlib
@@ -106,7 +118,12 @@ let bind_cond params = function None -> None | Some p -> Some (bind_pred params 
 let bind params stmt =
   match stmt with
   | Sql.Insert (t, vs) -> Sql.Insert (t, List.map (bind_pvalue params) vs)
-  | Sql.Select s -> Sql.Select { s with Sql.where = bind_cond params s.Sql.where }
+  | Sql.Select s ->
+    Sql.Select
+      { s with
+        Sql.where = bind_cond params s.Sql.where;
+        Sql.limit = Option.map (bind_pvalue params) s.Sql.limit;
+        Sql.offset = Option.map (bind_pvalue params) s.Sql.offset }
   | Sql.Delete (t, w) -> Sql.Delete (t, bind_cond params w)
   | Sql.Update (t, a, w) ->
     Sql.Update (t, List.map (fun (c, pv) -> (c, bind_pvalue params pv)) a, bind_cond params w)
@@ -123,7 +140,10 @@ let count_params stmt =
   let scan_cond = function Some p -> scan_pred p | None -> () in
   (match stmt with
    | Sql.Insert (_, vs) -> List.iter scan vs
-   | Sql.Select s -> scan_cond s.Sql.where
+   | Sql.Select s ->
+     scan_cond s.Sql.where;
+     Option.iter scan s.Sql.limit;
+     Option.iter scan s.Sql.offset
    | Sql.Delete (_, w) -> scan_cond w
    | Sql.Update (_, a, w) -> List.iter (fun (_, pv) -> scan pv) a; scan_cond w
    | _ -> ());
@@ -366,7 +386,7 @@ let run_join ~notice name1 name2 (lref, rref) kind sel =
   in
   let out = tmap (fun row -> List.map (fun (_, _, i) -> text_of_value (row.(i))) proj) rows in
   let out = if sel.Sql.distinct then dedupe out else out in
-  let out = match sel.Sql.limit with None -> out | Some n -> take n out in
+  let out = slice sel out in
   Rows (List.map (fun (c, ty, _) -> col_desc c ty) proj, out)
 
 (* output column descriptions without executing (Describe message) *)
@@ -412,7 +432,7 @@ let run_plain ?(presorted = false) t sel candidates =
     end
     else candidates
   in
-  let candidates = match sel.Sql.limit with None -> candidates | Some n -> take n candidates in
+  let candidates = slice sel candidates in
   let desc = List.map (fun (c, ty, _) -> col_desc c ty) cols in
   let rows = tmap (fun row -> List.map (fun i -> text_of_value row.(i)) idxs) candidates in
   Rows (desc, rows)
@@ -522,7 +542,7 @@ let run_aggregate t sel candidates =
     List.map (fun k -> let item_accs, _, _ = Hashtbl.find tbl k in List.map (fun (_, fin) -> text_of_value (fin ())) item_accs) keys
   in
   let rows = if sel.Sql.distinct then dedupe rows else rows in
-  let rows = match sel.Sql.limit with None -> rows | Some n -> take n rows in
+  let rows = slice sel rows in
   Rows (agg_desc t sel.Sql.items, rows)
 
 (* single-table SELECT: planner picks the access path, then project/aggregate *)
@@ -535,8 +555,15 @@ let run_table ~notice tname sel =
     let ordered =
       match (sel.Sql.where, sel.Sql.order_by) with
       | None, Some o when (not (is_agg_query sel)) && Catalog.find_index t o.Sql.by <> None ->
-        (* push LIMIT down as a top-k, unless DISTINCT (which changes the count) *)
-        let limit = if sel.Sql.distinct then None else sel.Sql.limit in
+        (* push LIMIT down as a top-k, unless DISTINCT (which changes the count).
+           With OFFSET we need offset+limit rows, then run_plain trims exactly. *)
+        let limit =
+          if sel.Sql.distinct then None
+          else
+            match pv_int "LIMIT" sel.Sql.limit with
+            | None -> None
+            | Some l -> Some (l + (match pv_int "OFFSET" sel.Sql.offset with Some o -> o | None -> 0))
+        in
         Catalog.scan_ordered t o.Sql.by ~desc:o.Sql.desc ?limit ()
       | _ -> None
     in
