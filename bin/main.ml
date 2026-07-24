@@ -87,7 +87,8 @@ let value_of_text = function
 
 (* statements that mutate data — an autocommit one is fsynced when it completes *)
 let is_write = function
-  | Sql.Insert _ | Sql.Delete _ | Sql.Update _ | Sql.Create _ | Sql.CreateIndex _ -> true
+  | Sql.Insert _ | Sql.Delete _ | Sql.Update _ | Sql.Create _ | Sql.CreateIndex _
+  | Sql.Drop _ | Sql.Truncate _ -> true
   | _ -> false
 
 let handle_query oc tx sql =

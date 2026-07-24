@@ -15,8 +15,16 @@
 type pvalue = Lit of Catalog.value | Param of int
 
 type agg = Count | Sum | Min | Max | Avg
+(* a `||` concatenation operand: a column reference or a literal value *)
+type concpart = CPcol of string | CPval of Catalog.value
 type sel_item = Star | Col of string | Agg of agg * string option (* arg None = star form *)
-type order = { by : string; desc : bool }
+              | Concat of concpart list (* a || b || 'x' *)
+type order = {
+  by : string; (* column name; "" when an ordinal is used *)
+  ordinal : int option; (* ORDER BY 1 -> select-list position *)
+  desc : bool;
+  nulls_first : bool option; (* None = PostgreSQL default (NULLS LAST for ASC, FIRST for DESC) *)
+}
 
 (* FROM clause: a single table, or an equi-join of two tables.
    Column references may be qualified ("emp.dept") — kept as "tbl.col" strings. *)
@@ -32,13 +40,22 @@ type pred =
 
 type cond = pred option (* optional WHERE clause *)
 
+(* HAVING predicate: comparisons over aggregates/columns, combined with AND/OR *)
+type hcond =
+  | HCmp of sel_item * Catalog.cmp * pvalue
+  | HAnd of hcond * hcond
+  | HOr of hcond * hcond
+
 type stmt =
   | Create of string * (string * Catalog.typ) list
   | CreateIndex of string * string (* table, column *)
-  | Insert of string * pvalue list
+  | Insert of string * string list option * pvalue list list (* table, optional column list, one-or-more row tuples *)
   | Select of select
   | Delete of string * cond
   | Update of string * (string * pvalue) list * cond (* table, SET assignments, WHERE *)
+  | Drop of string * bool (* table, IF EXISTS *)
+  | Truncate of string
+  | Explain of stmt
   | Other of string (* CommandComplete tag to report, e.g. "SET" *)
 
 and select = {
@@ -47,7 +64,7 @@ and select = {
   from : source;
   where : cond;
   group_by : string option;
-  having : (sel_item * Catalog.cmp * pvalue) option; (* filter groups by an aggregate/column *)
+  having : hcond option; (* filter groups by aggregates/columns, AND/OR combinable *)
   order_by : order option;
   limit : pvalue option; (* pvalue so LIMIT $1 works; resolved to an int at exec *)
   offset : pvalue option;
@@ -62,6 +79,8 @@ type tok =
   | TSym of char
   | TParam of int
   | TFloat of float
+  | TConcat (* || *)
+  | TQuoted of string (* "double-quoted" identifier — case preserved, never a keyword *)
   | TCmp of Catalog.cmp (* < <= > >= *)
 
 let is_ident_start c =
@@ -90,7 +109,10 @@ let tokenize s =
       incr i)
     else if c = '<' then
       if !i + 1 < n && s.[!i + 1] = '=' then (toks := TCmp Catalog.Le :: !toks; i := !i + 2)
+      else if !i + 1 < n && s.[!i + 1] = '>' then (toks := TCmp Catalog.Ne :: !toks; i := !i + 2)
       else (toks := TCmp Catalog.Lt :: !toks; incr i)
+    else if c = '!' && !i + 1 < n && s.[!i + 1] = '=' then (toks := TCmp Catalog.Ne :: !toks; i := !i + 2)
+    else if c = '|' && !i + 1 < n && s.[!i + 1] = '|' then (toks := TConcat :: !toks; i := !i + 2)
     else if c = '>' then
       if !i + 1 < n && s.[!i + 1] = '=' then (toks := TCmp Catalog.Ge :: !toks; i := !i + 2)
       else (toks := TCmp Catalog.Gt :: !toks; incr i)
@@ -114,6 +136,21 @@ let tokenize s =
           incr i)
       done;
       toks := TStr (Buffer.contents b) :: !toks
+    end
+    else if c = '"' then begin
+      (* double-quoted identifier; "" is an escaped quote; case preserved *)
+      incr i;
+      let b = Buffer.create 16 in
+      let fin = ref false in
+      while not !fin do
+        if !i >= n then failwith "unterminated quoted identifier";
+        let d = s.[!i] in
+        if d = '"' then
+          if !i + 1 < n && s.[!i + 1] = '"' then (Buffer.add_char b '"'; i := !i + 2)
+          else (incr i; fin := true)
+        else (Buffer.add_char b d; incr i)
+      done;
+      toks := TQuoted (Buffer.contents b) :: !toks
     end
     else if c = '$' then begin
       (* $n bind parameter placeholder *)
@@ -174,6 +211,7 @@ let parse sql =
   let name () =
     match peek () with
     | Some (TIdent s) -> advance (); String.lowercase_ascii s
+    | Some (TQuoted s) -> advance (); s (* case preserved *)
     | _ -> failwith "expected identifier"
   in
   (* a possibly-qualified column: "col" or "tbl.col" (kept as a "tbl.col" string) *)
@@ -271,9 +309,13 @@ let parse sql =
     expect_kw "insert";
     expect_kw "into";
     let t = name () in
+    (* optional column list: INSERT INTO t (a, b) ... *)
+    let cols = match peek () with Some (TSym '(') -> Some (paren_list name) | _ -> None in
     expect_kw "values";
-    let vals = paren_list value in
-    Insert (t, vals)
+    (* one or more parenthesized row tuples, comma-separated *)
+    let rows = ref [ paren_list value ] in
+    while peek () = Some (TSym ',') do advance (); rows := paren_list value :: !rows done;
+    Insert (t, cols, List.rev !rows)
   in
   let sel_item () =
     match peek () with
@@ -285,7 +327,23 @@ let parse sql =
       let arg = match peek () with Some (TSym '*') -> advance (); None | _ -> Some (colname ()) in
       sym ')';
       Agg (a, arg)
-    | Some (TIdent _) -> Col (colname ())
+    | Some (TStr _ | TNum _ | TIdent _ | TQuoted _) ->
+      (* a column or literal, possibly the start of a `||` concatenation *)
+      let operand () =
+        match peek () with
+        | Some (TStr s) -> advance (); CPval (Catalog.VText s)
+        | Some (TNum n) -> advance (); CPval (Catalog.VInt n)
+        | Some (TFloat f) -> advance (); CPval (Catalog.VFloat f)
+        | Some (TIdent _ | TQuoted _) -> CPcol (colname ())
+        | _ -> failwith "expected a concatenation operand"
+      in
+      let first = operand () in
+      if peek () = Some TConcat then begin
+        let parts = ref [ first ] in
+        while peek () = Some TConcat do advance (); parts := operand () :: !parts done;
+        Concat (List.rev !parts)
+      end
+      else (match first with CPcol c -> Col c | CPval _ -> failwith "expected column, '*', or aggregate")
     | _ -> failwith "expected column, '*', or aggregate"
   in
   let parse_select () =
@@ -318,23 +376,32 @@ let parse sql =
     let where = parse_where () in
     let group_by = if opt_kw "group" then (expect_kw "by"; Some (name ())) else None in
     let having =
-      if opt_kw "having" then (
-        let item = sel_item () in
-        let op =
-          match peek () with
-          | Some (TSym '=') -> advance (); Catalog.Eq
-          | Some (TCmp o) -> advance (); o
-          | _ -> failwith "expected a comparison operator in HAVING"
-        in
-        Some (item, op, value ()))
-      else None
+      let cmp_op () =
+        match peek () with
+        | Some (TSym '=') -> advance (); Catalog.Eq
+        | Some (TCmp o) -> advance (); o
+        | _ -> failwith "expected a comparison operator in HAVING"
+      in
+      let rec h_or () = let l = h_and () in if opt_kw "or" then HOr (l, h_or ()) else l
+      and h_and () = let l = h_atom () in if opt_kw "and" then HAnd (l, h_and ()) else l
+      and h_atom () =
+        match peek () with
+        | Some (TSym '(') -> advance (); let p = h_or () in sym ')'; p
+        | _ -> let it = sel_item () in let op = cmp_op () in HCmp (it, op, value ())
+      in
+      if opt_kw "having" then Some (h_or ()) else None
     in
     let order_by =
       if opt_kw "order" then (
         expect_kw "by";
-        let by = colname () in
+        let ordinal, by =
+          match peek () with Some (TNum n) -> advance (); (Some n, "") | _ -> (None, colname ())
+        in
         let desc = if opt_kw "desc" then true else (ignore (opt_kw "asc"); false) in
-        Some { by; desc })
+        let nulls_first =
+          if opt_kw "nulls" then Some (if opt_kw "first" then true else (expect_kw "last"; false)) else None
+        in
+        Some { by; ordinal; desc; nulls_first })
       else None
     in
     (* LIMIT/OFFSET take an integer literal or a $n bind param *)
@@ -362,16 +429,26 @@ let parse sql =
     loop ();
     Update (t, List.rev !acc, parse_where ())
   in
-  match peek () with
-  | Some (TIdent w) -> (
-    match String.lowercase_ascii w with
-    | "create" -> parse_create ()
-    | "insert" -> parse_insert ()
-    | "select" -> parse_select ()
-    | "delete" -> parse_delete ()
-    | "update" -> parse_update ()
-    | other -> Other (String.uppercase_ascii other))
-  | _ -> failwith "empty or invalid statement"
+  let rec parse_stmt () =
+    match peek () with
+    | Some (TIdent w) -> (
+      match String.lowercase_ascii w with
+      | "create" -> parse_create ()
+      | "insert" -> parse_insert ()
+      | "select" -> parse_select ()
+      | "delete" -> parse_delete ()
+      | "update" -> parse_update ()
+      | "drop" ->
+        advance (); expect_kw "table";
+        let ife = if opt_kw "if" then (expect_kw "exists"; true) else false in
+        Drop (name (), ife)
+      | "truncate" -> advance (); ignore (opt_kw "table"); Truncate (name ())
+      | "explain" ->
+        advance (); ignore (opt_kw "analyze"); ignore (opt_kw "verbose"); Explain (parse_stmt ())
+      | other -> Other (String.uppercase_ascii other))
+    | _ -> failwith "empty or invalid statement"
+  in
+  parse_stmt ()
 
 (* self-check: run via `main test` *)
 let demo () =
@@ -379,7 +456,7 @@ let demo () =
    | Create ("t", [ ("a", Catalog.Int); ("b", Catalog.Text) ]) -> ()
    | _ -> assert false);
   (match parse "INSERT INTO t VALUES (1, 'x')" with
-   | Insert ("t", [ Lit (Catalog.VInt 1); Lit (Catalog.VText "x") ]) -> ()
+   | Insert ("t", None, [ [ Lit (Catalog.VInt 1); Lit (Catalog.VText "x") ] ]) -> ()
    | _ -> assert false);
   (match parse "SELECT * FROM t" with
    | Select { items = [ Star ]; from = Table "t"; where = None; _ } -> ()
@@ -400,7 +477,7 @@ let demo () =
    | Select { where = Some (Cmp ("a", Catalog.Ge, Lit (Catalog.VInt 5))); _ } -> ()
    | _ -> assert false);
   (match parse "INSERT INTO t VALUES ($1, $2)" with
-   | Insert ("t", [ Param 1; Param 2 ]) -> ()
+   | Insert ("t", None, [ [ Param 1; Param 2 ] ]) -> ()
    | _ -> assert false);
   (match parse "CREATE INDEX ON t (a)" with CreateIndex ("t", "a") -> () | _ -> assert false);
   (match parse "DELETE FROM t WHERE a = 1" with
@@ -411,6 +488,6 @@ let demo () =
    | _ -> assert false);
   (match parse "SELECT COUNT(*), SUM(a) FROM t GROUP BY b ORDER BY a DESC LIMIT 3" with
    | Select { items = [ Agg (Count, None); Agg (Sum, Some "a") ]; group_by = Some "b";
-              order_by = Some { by = "a"; desc = true }; limit = Some (Lit (Catalog.VInt 3)); _ } -> ()
+              order_by = Some { by = "a"; desc = true; _ }; limit = Some (Lit (Catalog.VInt 3)); _ } -> ()
    | _ -> assert false);
   print_endline "sql: ok"
